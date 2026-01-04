@@ -1,13 +1,13 @@
-#!/usr/bin/env -S deno run --allow-net --allow-read --allow-env
+#!/usr/bin/env -S deno run --allow-net --allow-read --allow-env --allow-write
 
 /**
  * Assefa Digital Bingo Game Server
- * Complete WebSocket server with admin protection
+ * Complete WebSocket server with admin protection - Deno Deploy Compatible
  */
 
 // ================ IMPORTS ================
 import { serve } from "https://deno.land/std@0.203.0/http/server.ts";
-import { acceptable, acceptWebSocket } from "https://deno.land/std@0.203.0/ws/mod.ts";
+import { upgradeWebSocket } from "https://deno.land/std@0.203.0/ws/mod.ts";
 
 // ================ TYPES ================
 interface Client {
@@ -41,6 +41,7 @@ const clients = new Map<string, Client>();
 const rooms = new Map<string, Room>();
 const clientRooms = new Map<string, string>(); // clientId -> roomId
 const rateLimits = new Map<string, { count: number; resetTime: number }>();
+const SERVER_START_TIME = Date.now(); // For calculating uptime
 
 // ================ UTILITY FUNCTIONS ================
 function generateClientId(): string {
@@ -88,9 +89,13 @@ function getClientIp(req: Request): string {
            "unknown";
 }
 
+function getUptime(): number {
+    return Math.floor((Date.now() - SERVER_START_TIME) / 1000);
+}
+
 // ================ WEB SOCKET HANDLER ================
-async function handleWebSocket(req: Request, clientId: string): Promise<Response> {
-    const { socket, response } = Deno.upgradeWebSocket(req);
+function handleWebSocket(req: Request): Response {
+    const { socket, response } = upgradeWebSocket(req);
     
     // Get client info from URL
     const url = new URL(req.url);
@@ -100,6 +105,7 @@ async function handleWebSocket(req: Request, clientId: string): Promise<Response
     const room = sanitizeInput(params.get("room") || "bingo_main");
     const role = (sanitizeInput(params.get("role") || "player")) as 'player' | 'admin' | 'spectator';
     const ip = getClientIp(req);
+    const clientId = generateClientId();
     
     // Create client object
     const client: Client = {
@@ -177,15 +183,9 @@ function handleWebSocketMessage(clientId: string, message: WebSocketMessage) {
     const client = clients.get(clientId);
     if (!client) return;
     
-    console.log(`Message from ${clientId}:`, message.type);
-    
     switch (message.type) {
         case "ping":
             client.socket.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
-            break;
-            
-        case "join":
-            // Already handled in connection
             break;
             
         case "bingo-number":
@@ -211,7 +211,7 @@ function handleWebSocketMessage(clientId: string, message: WebSocketMessage) {
             break;
             
         default:
-            console.log(`Unknown message type: ${message.type}`);
+            console.log(`Unknown message type: ${message.type} from ${clientId}`);
     }
 }
 
@@ -341,6 +341,8 @@ function broadcastToRoom(room: string, excludeClientId: string | null, message: 
                 client.socket.send(JSON.stringify(message));
             } catch (error) {
                 console.error(`Error sending to ${clientId}:`, error);
+                // Clean up disconnected client
+                handleClientDisconnect(clientId);
             }
         }
     }
@@ -380,7 +382,8 @@ async function handleRequest(req: Request): Promise<Response> {
     const headers = new Headers({
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET, POST, OPTIONS",
-        "access-control-allow-headers": "Content-Type"
+        "access-control-allow-headers": "Content-Type",
+        "access-control-max-age": "86400"
     });
     
     // Handle preflight requests
@@ -391,8 +394,7 @@ async function handleRequest(req: Request): Promise<Response> {
     // Handle WebSocket upgrade
     if (path === "/ws") {
         if (req.headers.get("upgrade") === "websocket") {
-            const clientId = generateClientId();
-            return await handleWebSocket(req, clientId);
+            return handleWebSocket(req);
         }
         return new Response("Expected WebSocket upgrade", { status: 400 });
     }
@@ -409,7 +411,7 @@ async function handleRequest(req: Request): Promise<Response> {
             timestamp: new Date().toISOString(),
             clients: clients.size,
             rooms: rooms.size,
-            uptime: process.uptime()
+            uptime: getUptime()
         }), {
             headers: { ...headers, "content-type": "application/json" }
         });
@@ -425,7 +427,8 @@ async function handleRequest(req: Request): Promise<Response> {
                 clientCount: room.clients.size,
                 createdAt: room.createdAt
             })),
-            uptime: process.uptime()
+            uptime: getUptime(),
+            serverStartTime: SERVER_START_TIME
         };
         
         return new Response(JSON.stringify(stats), {
@@ -690,7 +693,7 @@ async function generateAdminHtml(): Promise<void> {
                     
                     document.getElementById('playerCount').textContent = data.totalClients;
                     document.getElementById('roomCount').textContent = data.totalRooms;
-                    document.getElementById('uptime').textContent = Math.floor(data.uptime) + 's';
+                    document.getElementById('uptime').textContent = data.uptime + 's';
                 } catch (error) {
                     console.error('Error loading stats:', error);
                 }
@@ -864,14 +867,16 @@ async function main() {
     console.log(`🔗 Admin URL: http://localhost:${PORT}/admin.html?password=${ADMIN_PASSWORD}`);
     console.log(`🎮 Game URL: http://localhost:${PORT}`);
     console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
+    console.log(`⏱️  Server started at: ${new Date(SERVER_START_TIME).toISOString()}`);
     
     // Start server
-    serve(handleRequest, { port: PORT });
+    await serve(handleRequest, { port: PORT, hostname: "0.0.0.0" });
 }
 
 // Start the server
 if (import.meta.main) {
-    main();
+    main().catch(console.error);
 }
 
-export { main };
+// Export for testing
+export { main, handleRequest, getUptime };
